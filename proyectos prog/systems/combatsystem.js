@@ -38,7 +38,6 @@ export class CombatSystem {
 
         this.previewCard = null
 
-        // Animaciones pendientes: { cellId: string, anim: "attack"|"hit"|"death"|"summon" }
         this._pendingAnims = []
     }
 
@@ -53,7 +52,7 @@ export class CombatSystem {
             const el = document.querySelector(`[data-cell="${id}"]`)
             if (!el) return
             el.classList.remove("cell-anim-attack","cell-anim-hit","cell-anim-death","cell-anim-summon")
-            void el.offsetWidth // reflow para reiniciar animación
+            void el.offsetWidth
             el.classList.add(`cell-anim-${type}`)
             setTimeout(() => el.classList.remove(`cell-anim-${type}`), 600)
         })
@@ -80,16 +79,31 @@ export class CombatSystem {
             const level = this.game?.runManager?.level || 1
             pool = EnemyAI.getEnemyDeck(level)
         }
+        // FIX: Para el enemigo, si el pool es pequeño, duplicarlo para que no se quede sin cartas
+        if (side === "enemy") {
+            while (pool.length < 20) {
+                pool = [...pool, ...pool]
+            }
+        }
         return [...pool].sort(() => Math.random() - 0.5)
     }
 
     _drawCard(side) {
         if (side === "player") {
-            if (this.playerDeck.length === 0) return
+            if (this.playerDeck.length === 0) {
+                // Reciclar descarte si existe, o salir
+                return
+            }
             const card = this.playerDeck.shift()
             if (this.playerHand.length < 7) this.playerHand.push(card)
         } else {
-            if (this.enemyDeck.length === 0) return
+            if (this.enemyDeck.length === 0) {
+                // FIX: Si el enemigo se queda sin mazo, reconstruirlo
+                const level = this.game?.runManager?.level || 1
+                let pool = EnemyAI.getEnemyDeck(level)
+                while (pool.length < 20) pool = [...pool, ...pool]
+                this.enemyDeck = [...pool].sort(() => Math.random() - 0.5)
+            }
             const card = this.enemyDeck.shift()
             if (this.enemyHand.length < 7) this.enemyHand.push(card)
         }
@@ -371,6 +385,26 @@ export class CombatSystem {
         this.render()
     }
 
+    // ─── Lógica de ataque al líder ────────────────────────────────────────────
+
+    /**
+     * Melee: puede atacar al líder solo si NO hay ninguna tropa enemiga en su columna
+     * (ni melee ni ranged en esa columna)
+     * Ranged: puede atacar al líder solo si NO hay NINGUNA tropa enemiga en todo el tablero
+     */
+    _canAttackLeader(troopRow, troopCol) {
+        if (troopRow === "melee") {
+            // Verificar que no haya nada en esa columna (ni melee ni ranged)
+            const meleeInCol  = this.board.getTroop("enemy", "melee",  troopCol)
+            const rangedInCol = this.board.getTroop("enemy", "ranged", troopCol)
+            return !meleeInCol && !rangedInCol
+        } else {
+            // Ranged: el tablero enemigo debe estar completamente vacío
+            const allEnemyTroops = this.board.getTroops("enemy")
+            return allEnemyTroops.length === 0
+        }
+    }
+
     // ─── Ataques ──────────────────────────────────────────────────────────────
 
     selectAttacker(row, col) {
@@ -406,7 +440,6 @@ export class CombatSystem {
             return
         }
 
-        // Animación: atacante se mueve, defensor recibe golpe
         this._queueAnim("player", attackerRow, attackerCol, "attack")
         if (defender) {
             this._queueAnim("enemy", row, col, "hit")
@@ -431,8 +464,23 @@ export class CombatSystem {
         if (!this.selectedAttacker) return
         if (this.attacksUsed >= this.attackLimit) return
         if (this.gameOver) return
-        const attacker = this.selectedAttacker.troop
-        this._queueAnim("player", this.selectedAttacker.row, this.selectedAttacker.col, "attack")
+
+        const attacker    = this.selectedAttacker.troop
+        const attackerRow = this.selectedAttacker.row
+        const attackerCol = this.selectedAttacker.col
+
+        // FIX: Validar reglas según tipo de tropa
+        if (!this._canAttackLeader(attackerRow, attackerCol)) {
+            if (attackerRow === "melee") {
+                this.log("❌ Melee solo puede atacar al líder si su columna está vacía (melee y ranged)")
+            } else {
+                this.log("❌ Ranged solo puede atacar al líder si no hay ninguna tropa enemiga")
+            }
+            this.render()
+            return
+        }
+
+        this._queueAnim("player", attackerRow, attackerCol, "attack")
         this.enemyHealth -= attacker.attack
         attacker.hasAttacked = true
         this.log(`⚔️ ${attacker.name} ataca al líder enemigo: -${attacker.attack} HP`)
@@ -564,6 +612,11 @@ export class CombatSystem {
         const pHpPct = Math.max(0, Math.round((this.playerHealth / 30) * 100))
         const eHpPct = Math.max(0, Math.round((this.enemyHealth  / 30) * 100))
 
+        // FIX: Calcular si el botón "Atacar Líder" está disponible para el atacante seleccionado
+        const canLeaderAttack = this.selectedAttacker
+            ? this._canAttackLeader(this.selectedAttacker.row, this.selectedAttacker.col)
+            : false
+
         app.innerHTML = `
         <div class="game-wrapper">
 
@@ -597,10 +650,11 @@ export class CombatSystem {
                     ${this._renderRow("enemy","melee", selId,healMode,spellMode,sacrificeAllyMode,sacrificeEnemyMode,placingCard)}
                 </div>
 
-                <!-- Divisor -->
+                <!-- Divisor con botón atacar líder -->
                 <div class="divider">
-                    <button class="btn-leader ${this.selectedAttacker ? 'btn-active' : ''}"
-                        onclick="window.game.combatSystem.attackEnemyLeaderDirect()">
+                    <button class="btn-leader ${this.selectedAttacker && canLeaderAttack ? 'btn-active' : ''}"
+                        onclick="window.game.combatSystem.attackEnemyLeaderDirect()"
+                        ${!this.selectedAttacker || !canLeaderAttack ? 'title="' + (!this.selectedAttacker ? 'Seleccioná una tropa primero' : (this.selectedAttacker.row === 'melee' ? 'Melee: su columna debe estar vacía' : 'Ranged: no debe haber tropas enemigas')) + '"' : ''}>
                         ⚡ Atacar Líder
                     </button>
                 </div>
@@ -659,7 +713,14 @@ export class CombatSystem {
                     ${this.selectedAttacker ? `
                         <div class="info-hint attacking">
                             ⚔️ Atacando con:<br><strong>${this.selectedAttacker.troop.name}</strong><br>
-                            <span style="color:var(--text-dim);font-size:0.75rem">Clickeá un enemigo o el líder</span>
+                            <span style="color:var(--text-dim);font-size:0.75rem">
+                                ${this.selectedAttacker.row === "melee"
+                                    ? "Melee: ataca su columna"
+                                    : "Ranged: ataca cualquier enemigo"}
+                            </span><br>
+                            <span style="color:${canLeaderAttack ? 'var(--green)' : 'var(--red-bright)'};font-size:0.72rem">
+                                ${canLeaderAttack ? "✅ Puede atacar al líder" : (this.selectedAttacker.row === "melee" ? "❌ Columna no vacía" : "❌ Hay tropas enemigas")}
+                            </span>
                         </div>
                     ` : ""}
                     ${healMode           ? `<div class="info-hint heal">💚 Elegí una tropa aliada para curar</div>` : ""}
@@ -695,7 +756,6 @@ export class CombatSystem {
         ` : ""}
         `
 
-        // ESC para cancelar
         document.onkeydown = (e) => {
             if (e.key === "Escape") {
                 this.selectedCardIndex     = null
@@ -800,7 +860,6 @@ export class CombatSystem {
                     ? `oncontextmenu="event.preventDefault(); window.game.combatSystem.showPreview(window._troopCardRef('${troop.id}','${side}','${row}',${col}))"`
                     : ""
 
-                // Imagen de la tropa (si existe)
                 const imgHtml = troop && troop.image
                     ? `<img class="troop-img" src="${troop.image}" alt="" onerror="this.style.display='none'">`
                     : ""
@@ -879,7 +938,6 @@ export class CombatSystem {
     }
 }
 
-// Helper global para preview por click derecho en el tablero
 window._troopCardRef = function(id, side, row, col) {
     const cs    = window.game.combatSystem
     const troop = cs.board.getTroop(side, row, col)
